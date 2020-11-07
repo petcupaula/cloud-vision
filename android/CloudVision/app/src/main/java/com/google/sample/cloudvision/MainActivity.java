@@ -315,7 +315,76 @@ public class MainActivity extends AppCompatActivity {
         return annotateRequest;
     }
 
+    private Vision.Images.Annotate prepareFaceLabelsRequest(Bitmap bitmap) throws IOException {
+        HttpTransport httpTransport = AndroidHttp.newCompatibleTransport();
+        JsonFactory jsonFactory = GsonFactory.getDefaultInstance();
 
+        VisionRequestInitializer requestInitializer =
+                new VisionRequestInitializer(CLOUD_VISION_API_KEY) {
+                    /**
+                     * We override this so we can inject important identifying fields into the HTTP
+                     * headers. This enables use of a restricted cloud platform API key.
+                     */
+                    @Override
+                    protected void initializeVisionRequest(VisionRequest<?> visionRequest)
+                            throws IOException {
+                        super.initializeVisionRequest(visionRequest);
+
+                        String packageName = getPackageName();
+                        visionRequest.getRequestHeaders().set(ANDROID_PACKAGE_HEADER, packageName);
+
+                        String sig = PackageManagerUtils.getSignature(getPackageManager(), packageName);
+
+                        visionRequest.getRequestHeaders().set(ANDROID_CERT_HEADER, sig);
+                    }
+                };
+
+        Vision.Builder builder = new Vision.Builder(httpTransport, jsonFactory, null);
+        builder.setVisionRequestInitializer(requestInitializer);
+
+        Vision vision = builder.build();
+
+        BatchAnnotateImagesRequest batchAnnotateImagesRequest =
+                new BatchAnnotateImagesRequest();
+        batchAnnotateImagesRequest.setRequests(new ArrayList<AnnotateImageRequest>() {{
+            AnnotateImageRequest annotateImageRequest = new AnnotateImageRequest();
+
+            // Add the image
+            Image base64EncodedImage = new Image();
+            // Convert the bitmap to a JPEG
+            // Just in case it's a format that Android understands but Cloud Vision
+            ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, byteArrayOutputStream);
+            byte[] imageBytes = byteArrayOutputStream.toByteArray();
+
+            // Base64 encode the JPEG
+            base64EncodedImage.encodeContent(imageBytes);
+            annotateImageRequest.setImage(base64EncodedImage);
+
+            // add the features we want
+            annotateImageRequest.setFeatures(new ArrayList<Feature>() {{
+                Feature labelDetection = new Feature();
+                labelDetection.setType("LABEL_DETECTION");
+                labelDetection.setMaxResults(MAX_LABEL_RESULTS);
+                add(labelDetection);
+
+                Feature faceDetection = new Feature();
+                faceDetection.setType("FACE_DETECTION");
+                add(faceDetection);
+            }});
+
+            // Add the list of one thing to the request
+            add(annotateImageRequest);
+        }});
+
+        Vision.Images.Annotate annotateRequest =
+                vision.images().annotate(batchAnnotateImagesRequest);
+        // Due to a bug: requests to Vision API containing large images fail when GZipped.
+        annotateRequest.setDisableGZipContent(true);
+        Log.d(TAG, "created Cloud Vision request object, sending request");
+
+        return annotateRequest;
+    }
 
 
     private static class LableDetectionTask extends AsyncTask<Object, Void, String> {
@@ -386,6 +455,40 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private static class FaceLabelsTask extends AsyncTask<Object, Void, String> {
+        private final WeakReference<MainActivity> mActivityWeakReference;
+        private Vision.Images.Annotate mRequest;
+
+        FaceLabelsTask(MainActivity activity, Vision.Images.Annotate annotate) {
+            mActivityWeakReference = new WeakReference<>(activity);
+            mRequest = annotate;
+        }
+
+        @Override
+        protected String doInBackground(Object... params) {
+            try {
+                Log.d(TAG, "created Cloud Vision request object, sending request");
+                BatchAnnotateImagesResponse response = mRequest.execute();
+                return convertFaceLabelsResponseToString(response);
+
+            } catch (GoogleJsonResponseException e) {
+                Log.d(TAG, "failed to make API request because " + e.getContent());
+            } catch (IOException e) {
+                Log.d(TAG, "failed to make API request because of other IOException " +
+                        e.getMessage());
+            }
+            return "Cloud Vision API request failed. Check logs for details.";
+        }
+
+        protected void onPostExecute(String result) {
+            MainActivity activity = mActivityWeakReference.get();
+            if (activity != null && !activity.isFinishing()) {
+                TextView imageDetail = activity.findViewById(R.id.image_details);
+                imageDetail.setText(result);
+            }
+        }
+    }
+
     private void callCloudVision(final Bitmap bitmap) {
         // Switch text to loading
         mImageDetails.setText(R.string.loading_message);
@@ -395,8 +498,10 @@ public class MainActivity extends AppCompatActivity {
             // TO-DO: update with face detection
             //AsyncTask<Object, Void, String> labelDetectionTask = new LableDetectionTask(this, prepareAnnotationRequest(bitmap));
             //labelDetectionTask.execute();
-            AsyncTask<Object, Void, String> faceDetectionTask = new FaceDetectionTask(this, prepareFaceRequest(bitmap));
-            faceDetectionTask.execute();
+            //AsyncTask<Object, Void, String> faceDetectionTask = new FaceDetectionTask(this, prepareFaceRequest(bitmap));
+            //faceDetectionTask.execute();
+            AsyncTask<Object, Void, String> faceLabelsDetectionTask = new FaceLabelsTask(this, prepareFaceLabelsRequest(bitmap));
+            faceLabelsDetectionTask.execute();
         } catch (IOException e) {
             Log.d(TAG, "failed to make API request because of other IOException " +
                     e.getMessage());
@@ -445,6 +550,32 @@ public class MainActivity extends AppCompatActivity {
         List<FaceAnnotation> labels = response.getResponses().get(0).getFaceAnnotations();
         if (labels != null) {
             for (FaceAnnotation label : labels) {
+                message.append(String.format(Locale.US, "anger: %s%njoy: %s%nsurprise: %s%nsorrow: %s", label.getAngerLikelihood(), label.getJoyLikelihood(), label.getSurpriseLikelihood(), label.getSorrowLikelihood()));
+                message.append("\n");
+            }
+        } else {
+            message.append("nothing");
+        }
+
+        return message.toString();
+    }
+
+    private static String convertFaceLabelsResponseToString(BatchAnnotateImagesResponse response) {
+        StringBuilder message = new StringBuilder("I found these things:\n\n");
+
+        List<EntityAnnotation> labels = response.getResponses().get(0).getLabelAnnotations();
+        if (labels != null) {
+            for (EntityAnnotation label : labels) {
+                message.append(String.format(Locale.US, "%.3f: %s", label.getScore(), label.getDescription()));
+                message.append("\n");
+            }
+        } else {
+            message.append("nothing");
+        }
+
+        List<FaceAnnotation> emotions = response.getResponses().get(0).getFaceAnnotations();
+        if (emotions != null) {
+            for (FaceAnnotation label : emotions) {
                 message.append(String.format(Locale.US, "anger: %s%njoy: %s%nsurprise: %s%nsorrow: %s", label.getAngerLikelihood(), label.getJoyLikelihood(), label.getSurpriseLikelihood(), label.getSorrowLikelihood()));
                 message.append("\n");
             }
